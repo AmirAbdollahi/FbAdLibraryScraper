@@ -1,0 +1,27 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.log
+*.tmp
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/
+
+# Output
+responses/
+screenshots/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
