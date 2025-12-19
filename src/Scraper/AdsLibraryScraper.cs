@@ -38,9 +38,11 @@ namespace FbAdLibraryScraper.Scraper
         public async Task<List<AdItem>> RunAsync()
         {
             using var playwright = await Playwright.CreateAsync();
+            // For demo: use SlowMo only when running headful so human can observe UI
             await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
             {
-                Headless = _headless
+                Headless = _headless,
+                SlowMo = _headless ? 0 : 100
             });
 
             var context = await browser.NewContextAsync(new BrowserNewContextOptions
@@ -51,17 +53,66 @@ namespace FbAdLibraryScraper.Scraper
 
             var page = await context.NewPageAsync();
 
-            // Listen for network responses and persist candidate GraphQL/XHR payloads
+            // Prepare debug log file
+            var debugPath = Path.Combine(_storage.OutputDir, "debug_requests.log");
+            try { Directory.CreateDirectory(_storage.OutputDir); } catch { }
+
+            File.WriteAllText(debugPath, $"DEBUG START {DateTime.UtcNow:O}\n");
+
+            int debugCount = 0;
+            bool firstDataResponseReceived = false;
+
+            // Log requests
+            page.Request += (_, req) =>
+            {
+                try
+                {
+                    if (Interlocked.Increment(ref debugCount) <= 1000)
+                    {
+                        var line = $"REQ {DateTime.UtcNow:O} {req.Method} {req.Url}";
+                        File.AppendAllText(debugPath, line + Environment.NewLine);
+                    }
+                }
+                catch { }
+            };
+
+            // Log responses and optionally store JSON snippets
+            page.Response += async (_, resp) =>
+            {
+                try
+                {
+                    if (Volatile.Read(ref debugCount) <= 1000)
+                    {
+                        var line = $"RESP {DateTime.UtcNow:O} {resp.Status} {resp.Url}";
+                        File.AppendAllText(debugPath, line + Environment.NewLine);
+
+                        if (resp.Headers != null && resp.Headers.TryGetValue("content-type", out var ct) && ct != null && ct.Contains("json", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string? text = null;
+                            try { text = await resp.TextAsync(); } catch { }
+                            if (!string.IsNullOrEmpty(text))
+                            {
+                                var snippet = text.Length > 2000 ? text.Substring(0, 2000) : text;
+                                File.AppendAllText(debugPath, "BODY_SNIPPET_START\n" + snippet + "\nBODY_SNIPPET_END\n");
+                            }
+                        }
+                    }
+                }
+                catch { }
+            };
+
+            // Save full responses for ads library or graphql
             page.Response += async (_, response) =>
             {
                 try
                 {
-                    if (IsAdsGraphQlResponse(response))
+                    if (IsAdsLibraryResponse(response))
                     {
-                        var text = await response.TextAsync();
-                        var path = await _storage.SaveRawResponseAsync(text, Interlocked.Increment(ref _respIndex));
-                        _savedResponsePaths.Add(path);
-                        Console.WriteLine($"[info] saved response -> {Path.GetFileName(path)}");
+                        var txt = await response.TextAsync();
+                        var saved = await _storage.SaveRawResponseAsync(txt, Interlocked.Increment(ref _respIndex));
+                        _savedResponsePaths.Add(saved);
+                        Console.WriteLine($"[info] saved response -> {Path.GetFileName(saved)}");
+                        firstDataResponseReceived = true;
                     }
                 }
                 catch (Exception ex)
@@ -72,66 +123,76 @@ namespace FbAdLibraryScraper.Scraper
 
             try
             {
-                // Append simple query params (may or may not pre-fill)
-                var url = BuildUrlWithParams(_startUrl, _country, _category, _query);
-                Console.WriteLine($"[info] Navigating to: {url}");
-                await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 45000 });
+                Console.WriteLine($"[info] Navigating to: {_startUrl}");
+                await page.GotoAsync(_startUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 60000 });
 
-                // If page requires human solving (captcha) the user can do it headful
+                // Wait for page readiness: visible text "Search ads"
+                await page.GetByText("Search ads", new() { Exact = true }).WaitForAsync(new LocatorWaitForOptions { Timeout = 30000 });
+                Console.WriteLine("[info] Page ready: 'Search ads' visible");
+
+                // Mandatory first interaction: focus the search input
+                var focusSuccess = await FocusSearchInputAsync(page);
+                if (!focusSuccess)
+                {
+                    await TakeScreenshotAndLogDomAsync(page, "search_input_focus_fail");
+                    throw new Exception("Failed to focus search input");
+                }
+
+                // Best-effort close common overlays/consent banners
+                await TryCloseOverlaysAsync(page);
+
                 if (!_headless)
                 {
                     Console.WriteLine("[info] Running headful — if a CAPTCHA appears solve it manually in the browser.");
                 }
 
-                // Try to fill search input if present (best-effort)
-                try
+                // Click country dropdown and select "United States"
+                var countrySuccess = await SelectCountryAsync(page);
+                Console.WriteLine($"[info] SelectCountryAsync -> {countrySuccess}");
+                if (!countrySuccess)
                 {
-                    if (!string.IsNullOrEmpty(_query))
-                    {
-                        var searchSelectors = new[] { "input[type='search']", "input[placeholder*='Search']", "input[aria-label='Search']", "input[role='combobox']" };
-                        foreach (var sel in searchSelectors)
-                        {
-                            var el = await page.QuerySelectorAsync(sel);
-                            if (el != null)
-                            {
-                                await el.FillAsync(_query);
-                                try { await el.PressAsync("Enter"); } catch { }
-                                Console.WriteLine($"[info] Filled search input using selector {sel}");
-                                break;
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[warn] filling search input failed: {ex.Message}");
+                    await TakeScreenshotAndLogDomAsync(page, "country_select_fail");
+                    throw new Exception("Failed to select country");
                 }
 
-                // Trigger scrolling to load more data and capture GraphQL responses
-                for (int i = 0; i < _scrollRounds; i++)
+                // Click category dropdown and select "All ads"
+                var catSuccess = await SelectCategoryAsync(page);
+                Console.WriteLine($"[info] SelectCategoryAsync -> {catSuccess}");
+                if (!catSuccess)
+                {
+                    await TakeScreenshotAndLogDomAsync(page, "category_select_fail");
+                    throw new Exception("Failed to select category");
+                }
+
+                // Fill search input and press enter
+                if (!string.IsNullOrEmpty(_query))
+                {
+                    var searchSuccess = await FillSearchAndSubmitAsync(page, _query);
+                    Console.WriteLine($"[info] FillSearchAndSubmitAsync({_query}) -> {searchSuccess}");
+                    if (!searchSuccess)
+                    {
+                        await TakeScreenshotAndLogDomAsync(page, "search_fill_fail");
+                        throw new Exception("Failed to fill search");
+                    }
+                }
+
+                // Wait for first data response
+                Console.WriteLine("[info] Waiting for first ads library response...");
+                var firstResp = await page.WaitForResponseAsync(r => IsAdsLibraryResponse(r), new PageWaitForResponseOptions { Timeout = 30000 });
+                Console.WriteLine($"[info] First data response received: {firstResp.Url}");
+
+                // Now scroll to load more
+                for (int i = 0; i < Math.Max(1, _scrollRounds); i++)
                 {
                     Console.WriteLine($"[info] scroll round {i + 1}/{_scrollRounds}");
-                    await page.EvaluateAsync("() => { window.scrollBy(0, window.innerHeight * 2); }");
-
-                    try
-                    {
-                        // Wait for at least one GraphQL/XHR response within timeout
-                        var resp = await page.WaitForResponseAsync(r => IsAdsGraphQlResponse(r), new PageWaitForResponseOptions { Timeout = 15000 });
-                        Console.WriteLine($"[info] observed network response: {resp.Url}");
-                    }
-                    catch (TimeoutException)
-                    {
-                        Console.WriteLine("[info] no network response in this scroll interval");
-                    }
-
-                    await Task.Delay(1200);
+                    await page.EvaluateAsync("() => window.scrollBy(0, window.innerHeight * 2)");
+                    await Task.Delay(2000);
                 }
 
-                // Wait briefly for final responses
+                // Wait for final network idle
                 await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions { Timeout = 5000 });
                 Console.WriteLine("[info] finished scrolling, parsing collected payloads...");
 
-                // Parse saved files (heuristic)
                 var parsed = new List<AdItem>();
                 foreach (var path in _savedResponsePaths)
                 {
@@ -148,7 +209,6 @@ namespace FbAdLibraryScraper.Scraper
                     }
                 }
 
-                // dedupe simple
                 var deduped = parsed
                     .GroupBy(a => (a.AdText ?? "") + "||" + (a.AdvertiserName ?? ""))
                     .Select(g => g.First())
@@ -156,15 +216,16 @@ namespace FbAdLibraryScraper.Scraper
 
                 Console.WriteLine($"[info] parsed {parsed.Count} items -> {deduped.Count} deduped");
 
-                // Save parsed results
                 await _storage.SaveParsedResultsAsync(deduped);
+
+                // Take success screenshot
+                await TakeScreenshotAsync(page, "success");
 
                 return deduped;
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[error] scraping run failed: {ex.Message}");
-                // try screenshot
                 try
                 {
                     var shot = await page.ScreenshotAsync();
@@ -191,22 +252,282 @@ namespace FbAdLibraryScraper.Scraper
             return qp.Count == 0 ? baseUrl : $"{baseUrl.TrimEnd('/')}/?{string.Join("&", qp)}";
         }
 
-        private static bool IsAdsGraphQlResponse(IResponse response)
+        private static bool IsAdsLibraryResponse(IResponse response)
         {
             try
             {
-                if (response.Url.Contains("/api/graphql", StringComparison.OrdinalIgnoreCase)) return true;
-                var req = response.Request;
-                if (req != null && req.Headers != null && req.Headers.TryGetValue("x-fb-friendly-name", out var h))
-                {
-                    if (!string.IsNullOrEmpty(h) && h.Contains("AdLibrarySearchPaginationQuery")) return true;
-                }
+                if (response.Url.Contains("/ads/library/", StringComparison.OrdinalIgnoreCase) &&
+                    response.Headers.TryGetValue("content-type", out var ct) &&
+                    ct.Contains("json", StringComparison.OrdinalIgnoreCase))
+                    return true;
             }
             catch { }
             return false;
         }
 
-        // Heuristic extractor - same idea as before (keeps it resilient)
+        private async Task<bool> FocusSearchInputAsync(IPage page)
+        {
+            try
+            {
+                // Try strategies in order, pick the first visible one
+                ILocator? searchInput = null;
+
+                // a) input[placeholder*="Search"]
+                var candidates = page.Locator("input[placeholder*=\"Search\"]");
+                var count = await candidates.CountAsync();
+                for (int i = 0; i < count; i++)
+                {
+                    var cand = candidates.Nth(i);
+                    if (await cand.IsVisibleAsync())
+                    {
+                        searchInput = cand;
+                        Console.WriteLine("[info] Found search input by placeholder");
+                        break;
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    // b) input[aria-label*="Search"]
+                    candidates = page.Locator("input[aria-label*=\"Search\"]");
+                    count = await candidates.CountAsync();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var cand = candidates.Nth(i);
+                        if (await cand.IsVisibleAsync())
+                        {
+                            searchInput = cand;
+                            Console.WriteLine("[info] Found search input by aria-label");
+                            break;
+                        }
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    // c) role="combobox"
+                    candidates = page.Locator("[role=\"combobox\"]");
+                    count = await candidates.CountAsync();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var cand = candidates.Nth(i);
+                        if (await cand.IsVisibleAsync())
+                        {
+                            searchInput = cand;
+                            Console.WriteLine("[info] Found search input by role combobox");
+                            break;
+                        }
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    // d) the only visible input element with width > 200px
+                    var inputs = page.Locator("input");
+                    count = await inputs.CountAsync();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var input = inputs.Nth(i);
+                        var isVisible = await input.IsVisibleAsync();
+                        if (isVisible)
+                        {
+                            var boundingBox = await input.BoundingBoxAsync();
+                            if (boundingBox != null && boundingBox.Width > 200)
+                            {
+                                searchInput = input;
+                                Console.WriteLine("[info] Found search input by visible width > 200px");
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    return false;
+                }
+
+                // Scroll into view
+                await searchInput.ScrollIntoViewIfNeededAsync();
+
+                // Click the input
+                await searchInput.ClickAsync();
+
+                // Assert that document.activeElement === input
+                var isFocused = await page.EvaluateAsync<bool>(@"(locator) => {
+                    return document.activeElement === locator;
+                }", await searchInput.ElementHandleAsync());
+
+                if (isFocused)
+                {
+                    Console.WriteLine("[info] Search input focused successfully");
+                    return true;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[warn] FocusSearchInputAsync failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task<bool> SelectCountryAsync(IPage page)
+        {
+            try
+            {
+                // Click the country dropdown trigger (button, div with role=button, or div with text "United States")
+                await page.Locator("button, [role='button'], div").Filter(new() { HasText = "United States" }).First.ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+                Console.WriteLine("[info] Clicked country dropdown trigger");
+
+                // Wait for the dropdown option to appear
+                await page.Locator("[role='option']").Filter(new() { HasText = "United States" }).WaitForAsync(new LocatorWaitForOptions { Timeout = 5000 });
+                Console.WriteLine("[info] Country dropdown opened");
+
+                // Locate the option with exact visible text "United States"
+                var option = page.Locator("[role='option']").Filter(new() { HasText = "United States" });
+                await option.ScrollIntoViewIfNeededAsync();
+                await option.ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+                Console.WriteLine("[info] Selected 'United States' option");
+
+                // Verify the trigger still displays "United States"
+                await page.WaitForSelectorAsync("text=\"United States\"", new PageWaitForSelectorOptions { Timeout = 2000 });
+                Console.WriteLine("[info] Country selection verified");
+                await Task.Delay(500);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[warn] SelectCountryAsync failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task<bool> SelectCategoryAsync(IPage page)
+        {
+            try
+            {
+                // Click category selector near "All ads"
+                await page.ClickAsync("text=\"All ads\"", new PageClickOptions { Timeout = 5000 });
+                // Select "All ads" by visible text
+                await page.ClickAsync("text=\"All ads\"", new PageClickOptions { Timeout = 5000 });
+                await Task.Delay(500);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[warn] SelectCategoryAsync failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task<bool> FillSearchAndSubmitAsync(IPage page, string query)
+        {
+            try
+            {
+                // Locate input by placeholder "Search by keyword or advertiser"
+                var searchInput = page.GetByPlaceholder("Search by keyword or advertiser");
+                await searchInput.WaitForAsync(new LocatorWaitForOptions { Timeout = 5000 });
+                // Ensure it is visible and enabled
+                var isVisible = await searchInput.IsVisibleAsync();
+                var isEnabled = await searchInput.IsEnabledAsync();
+                if (!isVisible || !isEnabled) return false;
+
+                await searchInput.ClickAsync();
+                // Type keyword slowly (50–100ms per char)
+                foreach (var c in query)
+                {
+                    await page.Keyboard.TypeAsync(c.ToString());
+                    await Task.Delay(Random.Shared.Next(50, 101));
+                }
+                await page.Keyboard.PressAsync("Enter");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[warn] FillSearchAndSubmitAsync failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task TakeScreenshotAsync(IPage page, string suffix)
+        {
+            try
+            {
+                var shot = await page.ScreenshotAsync();
+                await _storage.SaveScreenshotBytesAsync(shot, suffix);
+                Console.WriteLine($"[info] Screenshot saved: {suffix}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[warn] TakeScreenshotAsync failed: {ex.Message}");
+            }
+        }
+
+        private async Task TakeScreenshotAndLogDomAsync(IPage page, string suffix)
+        {
+            await TakeScreenshotAsync(page, suffix);
+            try
+            {
+                var dom = await page.EvaluateAsync<string>("() => document.body.outerHTML");
+                var domPath = Path.Combine(_storage.OutputDir, $"{suffix}_dom.html");
+                await File.WriteAllTextAsync(domPath, dom);
+                Console.WriteLine($"[info] DOM snapshot saved: {suffix}_dom.html");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[warn] DOM snapshot failed: {ex.Message}");
+            }
+        }
+
+        private static string MapCountryCodeToName(string code)
+        {
+            return code.ToUpper() switch
+            {
+                "US" => "United States",
+                "CA" => "Canada",
+                "GB" => "United Kingdom",
+                "AU" => "Australia",
+                _ => code // fallback
+            };
+        }
+
+        private async Task TryCloseOverlaysAsync(IPage page)
+        {
+            try
+            {
+                // close common cookie/consent dialogs by clicking obvious buttons
+                var clicked = false;
+                var candidateTexts = new[] { "Accept", "I accept", "Agree", "Got it", "OK", "Close" };
+                foreach (var t in candidateTexts)
+                {
+                    try { await page.ClickAsync($"text=\"{t}\"", new PageClickOptions { Timeout = 1500 }); clicked = true; break; } catch { }
+                }
+
+                if (!clicked)
+                {
+                    // JS remove very large overlays if present (best-effort, not bypassing protections)
+                    await page.EvaluateAsync(@"() => {
+                        const overlays = Array.from(document.querySelectorAll('div')).filter(d => {
+                            try {
+                                const s = window.getComputedStyle(d);
+                                return s.position === 'fixed' && s.zIndex && parseInt(s.zIndex) > 1000 && (d.clientHeight > 50 || d.clientWidth > 50);
+                            } catch { return false; }
+                        });
+                        for (const o of overlays) { o.style.display = 'none'; }
+                        return overlays.length > 0;
+                    }");
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Heuristic extractor - look for ad-like objects in GraphQL / JSON payloads.
+        /// </summary>
         private static List<AdItem> ExtractAdItemsFromGraphQl(JsonElement root)
         {
             var results = new List<AdItem>();
@@ -230,43 +551,43 @@ namespace FbAdLibraryScraper.Scraper
                 }
             }
 
-            bool TryBuildAdFromElement(JsonElement el, out AdItem item)
-            {
-                item = new AdItem();
-
-                string? TryGet(JsonElement e, params string[] names)
-                {
-                    if (e.ValueKind != JsonValueKind.Object) return null;
-                    foreach (var n in names)
-                    {
-                        if (e.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String)
-                            return v.GetString();
-                    }
-                    return null;
-                }
-
-                var adText = TryGet(el, "bodyText", "body", "message", "text", "ad_text");
-                var advertiser = TryGet(el, "advertiserName", "pageName", "publisher", "advertiser");
-                var startDate = TryGet(el, "startDate", "start_date", "creation_time");
-                var url = TryGet(el, "ad_url", "url", "link");
-
-                if (string.IsNullOrEmpty(adText) && el.TryGetProperty("creative", out var creative))
-                {
-                    adText = TryGet(creative, "bodyText", "body", "message", "text");
-                }
-
-                if (string.IsNullOrEmpty(adText) && string.IsNullOrEmpty(advertiser))
-                    return false;
-
-                item.AdText = adText;
-                item.AdvertiserName = advertiser;
-                item.StartDate = startDate;
-                item.AdUrl = url;
-                return true;
-            }
-
             Recurse(root);
             return results;
+        }
+
+        private static bool TryBuildAdFromElement(JsonElement el, out AdItem item)
+        {
+            item = new AdItem();
+
+            string? TryGet(JsonElement e, params string[] names)
+            {
+                if (e.ValueKind != JsonValueKind.Object) return null;
+                foreach (var n in names)
+                {
+                    if (e.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String)
+                        return v.GetString();
+                }
+                return null;
+            }
+
+            var adText = TryGet(el, "bodyText", "body", "message", "text", "ad_text");
+            var advertiser = TryGet(el, "advertiserName", "pageName", "publisher", "advertiser");
+            var startDate = TryGet(el, "startDate", "start_date", "creation_time");
+            var url = TryGet(el, "ad_url", "url", "link");
+
+            if (string.IsNullOrEmpty(adText) && el.TryGetProperty("creative", out var creative))
+            {
+                adText = TryGet(creative, "bodyText", "body", "message", "text");
+            }
+
+            if (string.IsNullOrEmpty(adText) && string.IsNullOrEmpty(advertiser))
+                return false;
+
+            item.AdText = adText;
+            item.AdvertiserName = advertiser;
+            item.StartDate = startDate;
+            item.AdUrl = url;
+            return true;
         }
     }
 }

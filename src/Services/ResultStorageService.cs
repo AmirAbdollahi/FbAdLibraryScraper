@@ -15,11 +15,14 @@ namespace FbAdLibraryScraper.Services
 
         public ResultStorageService(string outputDir, string screenshotDir)
         {
-            _outputDir = outputDir;
-            _screenshotDir = screenshotDir;
+            _outputDir = string.IsNullOrWhiteSpace(outputDir) ? Path.Combine(Directory.GetCurrentDirectory(), "responses") : outputDir;
+            _screenshotDir = string.IsNullOrWhiteSpace(screenshotDir) ? Path.Combine(Directory.GetCurrentDirectory(), "screenshots") : screenshotDir;
             Directory.CreateDirectory(_outputDir);
             Directory.CreateDirectory(_screenshotDir);
         }
+
+        // expose output dir so other classes can write debug logs
+        public string OutputDir => _outputDir;
 
         public async Task<string> SaveRawResponseAsync(string content, int index)
         {
