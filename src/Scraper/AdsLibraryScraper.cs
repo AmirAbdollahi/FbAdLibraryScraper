@@ -383,21 +383,92 @@ namespace FbAdLibraryScraper.Scraper
                 await page.Locator("button, [role='button'], div").Filter(new() { HasText = "United States" }).First.ClickAsync(new LocatorClickOptions { Timeout = 5000 });
                 Console.WriteLine("[info] Clicked country dropdown trigger");
 
-                // Wait for the dropdown option to appear
-                await page.Locator("[role='option']").Filter(new() { HasText = "United States" }).WaitForAsync(new LocatorWaitForOptions { Timeout = 5000 });
+                // Wait for the dropdown to open (assume it opens after click)
+                await Task.Delay(500); // Allow dropdown to open
                 Console.WriteLine("[info] Country dropdown opened");
 
-                // Locate the option with exact visible text "United States"
-                var option = page.Locator("[role='option']").Filter(new() { HasText = "United States" });
-                await option.ScrollIntoViewIfNeededAsync();
-                await option.ClickAsync(new LocatorClickOptions { Timeout = 5000 });
-                Console.WriteLine("[info] Selected 'United States' option");
+                // Send ArrowDown to activate keyboard-navigation mode
+                await page.Keyboard.PressAsync("ArrowDown");
+                Console.WriteLine("[info] ArrowDown sent to activate keyboard-navigation mode");
 
-                // Verify the trigger still displays "United States"
-                await page.WaitForSelectorAsync("text=\"United States\"", new PageWaitForSelectorOptions { Timeout = 2000 });
-                Console.WriteLine("[info] Country selection verified");
-                await Task.Delay(500);
-                return true;
+                // Send keyboard Tab presses in a loop until the input receives focus
+                var maxTabs = 8;
+                var inputFocused = false;
+
+                for (int tabCount = 1; tabCount <= maxTabs; tabCount++)
+                {
+                    await page.Keyboard.PressAsync("Tab");
+
+                    // Check if activeElement is INPUT with placeholder containing "Search"
+                    var activeElementInfo = await page.EvaluateAsync<(string tagName, string placeholder)>(@"() => {
+                        const el = document.activeElement;
+                        return {
+                            tagName: el ? el.tagName : '',
+                            placeholder: el ? el.getAttribute('placeholder') || '' : ''
+                        };
+                    }");
+
+                    Console.WriteLine($"[info] Tab sent ({tabCount}), active element tag: {activeElementInfo.tagName}, placeholder: {activeElementInfo.placeholder}");
+
+                    if (activeElementInfo.tagName == "INPUT" && activeElementInfo.placeholder.Contains("Search", StringComparison.OrdinalIgnoreCase))
+                    {
+                        inputFocused = true;
+                        Console.WriteLine("[info] Dropdown search input focused via keyboard");
+                        break;
+                    }
+                }
+
+                if (!inputFocused)
+                {
+                    await TakeScreenshotAndLogDomAsync(page, "country_keyboard_navigation_failed");
+                    throw new Exception("Keyboard navigation did not reach dropdown search input");
+                }
+
+                // Type the country name exactly: "United States"
+                await page.Keyboard.TypeAsync("United States");
+                Console.WriteLine("[info] Typed 'United States' into search textbox");
+
+                // Wait for dropdown list to visually filter
+                await Task.Delay(1000);
+
+                // Verify that the dropdown list contents change (e.g. number of visible options decreases or matching text appears)
+                var listChanged = await page.EvaluateAsync<bool>(@"() => {
+                    const options = document.querySelectorAll('[role=""option""]');
+                    const visibleOptions = Array.from(options).filter(opt => opt.offsetParent !== null);
+                    // Check if ""United States"" is among visible options or list is filtered
+                    const hasUnitedStates = Array.from(visibleOptions).some(opt => opt.textContent.includes('United States'));
+                    return hasUnitedStates || visibleOptions.length < 10; // Assume filtering if less than 10 options
+                }");
+
+                if (!listChanged)
+                {
+                    await TakeScreenshotAndLogDomAsync(page, "country_list_not_filtered");
+                    throw new Exception("Dropdown list did not filter after typing");
+                }
+
+                Console.WriteLine("[info] Dropdown list filtered successfully");
+
+                // Selection phase: press Enter
+                await page.Keyboard.PressAsync("Enter");
+                Console.WriteLine("[info] Pressed Enter to select country");
+
+                // Assert success: dropdown closes
+                var success = await page.EvaluateAsync<bool>(@"() => {
+                    const listbox = document.querySelector('[role=""listbox""]');
+                    return !listbox || listbox.offsetParent === null;
+                }");
+
+                if (success)
+                {
+                    Console.WriteLine("[info] Country selection successful");
+                    await Task.Delay(500);
+                    return true;
+                }
+                else
+                {
+                    await TakeScreenshotAndLogDomAsync(page, "country_enter_select_fail");
+                    throw new Exception("Enter did not select the country");
+                }
             }
             catch (Exception ex)
             {
@@ -410,12 +481,80 @@ namespace FbAdLibraryScraper.Scraper
         {
             try
             {
-                // Click category selector near "All ads"
-                await page.ClickAsync("text=\"All ads\"", new PageClickOptions { Timeout = 5000 });
-                // Select "All ads" by visible text
-                await page.ClickAsync("text=\"All ads\"", new PageClickOptions { Timeout = 5000 });
-                await Task.Delay(500);
-                return true;
+                // Click the category dropdown trigger (button, div with role=button, or div with text "All ads")
+                await page.Locator("button, [role='button'], div").Filter(new() { HasText = "All ads" }).First.ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+                Console.WriteLine("[info] Clicked category dropdown trigger");
+
+                // Wait for the dropdown to open (assume it opens after click)
+                await Task.Delay(500); // Allow dropdown to open
+                Console.WriteLine("[info] Category dropdown opened");
+
+                // Keyboard navigation: send Tab to focus the first selectable option
+                await page.Keyboard.PressAsync("Tab");
+                Console.WriteLine("[info] Sent Tab to focus first option in dropdown");
+
+                // Assert focus is on an option inside the dropdown
+                var isOptionFocused = await page.EvaluateAsync<bool>(@"() => {
+                    const el = document.activeElement;
+                    if (!el) return false;
+                    // Check if element has role=""option"" or is a focusable list item
+                    const role = el.getAttribute('role');
+                    if (role === 'option') return true;
+                    // Check if inside dropdown container or any element that is not the main search input
+                    let parent = el.parentElement;
+                    while (parent) {
+                        if (parent.getAttribute('role') === 'listbox' || parent.classList.contains('dropdown') || parent.classList.contains('menu')) {
+                            return true;
+                        }
+                        parent = parent.parentElement;
+                    }
+                    // If focus moved from the main search input, assume it's in the dropdown
+                    const mainSearch = document.querySelector('[role=""combobox""]');
+                    return el !== mainSearch;
+                }");
+
+                if (!isOptionFocused)
+                {
+                    await TakeScreenshotAndLogDomAsync(page, "category_tab_focus_fail");
+                    throw new Exception("Tab did not focus an option in the dropdown");
+                }
+
+                Console.WriteLine("[info] Focus confirmed on dropdown option");
+
+                // Selection logic
+                if (string.IsNullOrEmpty(_category))
+                {
+                    // Press Enter immediately to select default category (e.g. "All ads")
+                    await page.Keyboard.PressAsync("Enter");
+                    Console.WriteLine("[info] Pressed Enter to select default category");
+                }
+                else
+                {
+                    // Type category name directly (Facebook jumps to matching option)
+                    await page.Keyboard.TypeAsync(_category);
+                    Console.WriteLine($"[info] Typed '{_category}' to jump to matching option");
+                    await Task.Delay(500);
+                    await page.Keyboard.PressAsync("Enter");
+                    Console.WriteLine("[info] Pressed Enter to select category");
+                }
+
+                // Assert success: dropdown closes
+                var success = await page.EvaluateAsync<bool>(@"() => {
+                    const listbox = document.querySelector('[role=""listbox""]');
+                    return !listbox || listbox.offsetParent === null;
+                }");
+
+                if (success)
+                {
+                    Console.WriteLine("[info] Category selection successful");
+                    await Task.Delay(500);
+                    return true;
+                }
+                else
+                {
+                    await TakeScreenshotAndLogDomAsync(page, "category_enter_select_fail");
+                    throw new Exception("Enter did not select the category");
+                }
             }
             catch (Exception ex)
             {
@@ -428,13 +567,83 @@ namespace FbAdLibraryScraper.Scraper
         {
             try
             {
-                // Locate input by placeholder "Search by keyword or advertiser"
-                var searchInput = page.GetByPlaceholder("Search by keyword or advertiser");
-                await searchInput.WaitForAsync(new LocatorWaitForOptions { Timeout = 5000 });
-                // Ensure it is visible and enabled
-                var isVisible = await searchInput.IsVisibleAsync();
-                var isEnabled = await searchInput.IsEnabledAsync();
-                if (!isVisible || !isEnabled) return false;
+                // Use the same logic as FocusSearchInputAsync to find the search input
+                ILocator? searchInput = null;
+
+                // a) input[placeholder*="Search"]
+                var candidates = page.Locator("input[placeholder*=\"Search\"]");
+                var count = await candidates.CountAsync();
+                for (int i = 0; i < count; i++)
+                {
+                    var cand = candidates.Nth(i);
+                    if (await cand.IsVisibleAsync())
+                    {
+                        searchInput = cand;
+                        Console.WriteLine("[info] Found search input for filling by placeholder");
+                        break;
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    // b) input[aria-label*="Search"]
+                    candidates = page.Locator("input[aria-label*=\"Search\"]");
+                    count = await candidates.CountAsync();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var cand = candidates.Nth(i);
+                        if (await cand.IsVisibleAsync())
+                        {
+                            searchInput = cand;
+                            Console.WriteLine("[info] Found search input for filling by aria-label");
+                            break;
+                        }
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    // c) role="combobox"
+                    candidates = page.Locator("[role=\"combobox\"]");
+                    count = await candidates.CountAsync();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var cand = candidates.Nth(i);
+                        if (await cand.IsVisibleAsync())
+                        {
+                            searchInput = cand;
+                            Console.WriteLine("[info] Found search input for filling by role combobox");
+                            break;
+                        }
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    // d) the only visible input element with width > 200px
+                    var inputs = page.Locator("input");
+                    count = await inputs.CountAsync();
+                    for (int i = 0; i < count; i++)
+                    {
+                        var input = inputs.Nth(i);
+                        var isVisible = await input.IsVisibleAsync();
+                        if (isVisible)
+                        {
+                            var boundingBox = await input.BoundingBoxAsync();
+                            if (boundingBox != null && boundingBox.Width > 200)
+                            {
+                                searchInput = input;
+                                Console.WriteLine("[info] Found search input for filling by visible width > 200px");
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (searchInput == null)
+                {
+                    return false;
+                }
 
                 await searchInput.ClickAsync();
                 // Type keyword slowly (50–100ms per char)
